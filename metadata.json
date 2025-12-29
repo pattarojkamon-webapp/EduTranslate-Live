@@ -1,0 +1,7 @@
+{
+  "name": "EduTranslate Live",
+  "description": "Real-time bi-directional Thai-Chinese academic translator for Master's degree classrooms, featuring live voice activity detection and formal tone.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
