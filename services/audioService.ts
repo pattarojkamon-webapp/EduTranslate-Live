@@ -36,3 +36,36 @@ export async function decodeAudioData(
   }
   return buffer;
 }
+
+/**
+ * Downsamples audio from a source rate to 16000Hz for Gemini compatibility.
+ */
+export function downsample(buffer: Float32Array, fromRate: number, toRate: number = 16000): Int16Array {
+  if (fromRate === toRate) {
+    const result = new Int16Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      result[i] = Math.max(-32768, Math.min(32767, buffer[i] * 32768));
+    }
+    return result;
+  }
+  
+  const sampleRateRatio = fromRate / toRate;
+  const newLength = Math.round(buffer.length / sampleRateRatio);
+  const result = new Int16Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+    result[offsetResult] = Math.max(-32768, Math.min(32767, (accum / count) * 32768));
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}

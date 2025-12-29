@@ -1,9 +1,8 @@
-
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { getRoleInstruction, GEMINI_MODEL } from './constants';
 import { TranscriptEntry } from './types';
-import { encodeAudio, decodeAudio, decodeAudioData } from './services/audioService';
+import { encodeAudio, decodeAudio, decodeAudioData, downsample } from './services/audioService';
 import AudioVisualizer from './components/AudioVisualizer';
 
 type AccentColor = 'blue' | 'emerald' | 'purple' | 'amber';
@@ -29,8 +28,8 @@ const App: React.FC = () => {
   const [currentInput, setCurrentInput] = useState('');
   const [currentOutput, setCurrentOutput] = useState('');
 
-  const audioContextInRef = useRef<AudioContext | null>(null);
-  const audioContextOutRef = useRef<AudioContext | null>(null);
+  // Use a single AudioContext for all operations to prevent "Different Audio Context" error
+  const mainAudioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const sessionRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -91,8 +90,12 @@ const App: React.FC = () => {
     setStatus('idle');
     if (sessionRef.current) { try { sessionRef.current.close(); } catch (e) {} sessionRef.current = null; }
     if (streamRef.current) { streamRef.current.getTracks().forEach(track => track.stop()); streamRef.current = null; }
-    if (audioContextInRef.current) { audioContextInRef.current.close().catch(() => {}); audioContextInRef.current = null; }
-    if (audioContextOutRef.current) { audioContextOutRef.current.close().catch(() => {}); audioContextOutRef.current = null; }
+    
+    // Clean up AudioContext but keep it for visualizer if needed, or close it fully
+    if (mainAudioContextRef.current) { 
+      mainAudioContextRef.current.close().catch(() => {}); 
+      mainAudioContextRef.current = null; 
+    }
     analyserRef.current = null;
     sourcesRef.current.forEach(source => { try { source.stop(); } catch (e) {} });
     sourcesRef.current.clear();
@@ -101,7 +104,6 @@ const App: React.FC = () => {
 
   const startSession = async () => {
     try {
-      // 1. Basic checks for mobile
       if (!window.isSecureContext) {
         setErrorMessage('โปรดใช้งานผ่าน HTTPS เท่านั้น (Secure Context required)');
         return;
@@ -112,14 +114,20 @@ const App: React.FC = () => {
       
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // 2. iOS Audio Unlock Strategy (Play silent sound on user click)
-      const silentBuffer = new AudioContext().createBuffer(1, 1, 22050);
-      const silentSource = new AudioContext().createBufferSource();
+      // Initialize single AudioContext for everything
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      mainAudioContextRef.current = ctx;
+      
+      // iOS Audio Unlock: Play silent sound using the *same* context
+      const silentBuffer = ctx.createBuffer(1, 1, 22050);
+      const silentSource = ctx.createBufferSource();
       silentSource.buffer = silentBuffer;
-      silentSource.connect(new AudioContext().destination);
+      silentSource.connect(ctx.destination);
       silentSource.start(0);
 
-      // 3. Get Media with detailed error handling
+      // Crucial for mobile: resume within user gesture
+      await ctx.resume();
+
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -132,22 +140,13 @@ const App: React.FC = () => {
           setErrorMessage(`ไม่สามารถเปิดไมโครโฟนได้: ${err.message}`);
         }
         setStatus('error');
+        ctx.close();
         return;
       }
       
       streamRef.current = stream;
 
-      const ctxIn = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const ctxOut = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      audioContextInRef.current = ctxIn;
-      audioContextOutRef.current = ctxOut;
-
-      // Crucial for mobile: resume within user gesture
-      await ctxIn.resume();
-      await ctxOut.resume();
-
-      // Set up Analyser for visualizer
-      const analyser = ctxIn.createAnalyser();
+      const analyser = ctx.createAnalyser();
       analyser.fftSize = 256;
       analyserRef.current = analyser;
 
@@ -168,33 +167,39 @@ const App: React.FC = () => {
           onopen: () => {
             setStatus('listening');
             setIsRecording(true);
-            const source = ctxIn.createMediaStreamSource(stream);
-            source.connect(analyser); // Connect to visualizer analyser
+            const source = ctx.createMediaStreamSource(stream);
+            source.connect(analyser); 
             
-            const scriptProcessor = ctxIn.createScriptProcessor(4096, 1, 1);
+            const scriptProcessor = ctx.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
-              const int16 = new Int16Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              // Gemini expects 16000Hz PCM. Downsample if device is different.
+              const downsampledData = downsample(inputData, ctx.sampleRate, 16000);
+              
               sessionPromise.then(session => {
                 if (session) session.sendRealtimeInput({
-                  media: { data: encodeAudio(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' }
+                  media: { 
+                    data: encodeAudio(new Uint8Array(downsampledData.buffer)), 
+                    mimeType: 'audio/pcm;rate=16000' 
+                  }
                 });
               });
             };
             source.connect(scriptProcessor);
-            scriptProcessor.connect(ctxIn.destination);
+            scriptProcessor.connect(ctx.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
             const audioData = msg.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (audioData && audioContextOutRef.current) {
-              const ctx = audioContextOutRef.current;
-              if (ctx.state === 'suspended') await ctx.resume();
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              const buffer = await decodeAudioData(decodeAudio(audioData), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
+            if (audioData && mainAudioContextRef.current) {
+              const currentCtx = mainAudioContextRef.current;
+              if (currentCtx.state === 'suspended') await currentCtx.resume();
+              
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, currentCtx.currentTime);
+              // Decode audio using current context. Browser handles resampling to context's rate.
+              const buffer = await decodeAudioData(decodeAudio(audioData), currentCtx, 24000, 1);
+              const source = currentCtx.createBufferSource();
               source.buffer = buffer;
-              source.connect(ctx.destination);
+              source.connect(currentCtx.destination);
               source.addEventListener('ended', () => sourcesRef.current.delete(source));
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += buffer.duration;
@@ -214,19 +219,27 @@ const App: React.FC = () => {
               sourcesRef.current.clear(); nextStartTimeRef.current = 0;
             }
           },
-          onerror: (err) => { setErrorMessage('พบข้อผิดพลาดในการเชื่อมต่อ'); stopSession(); },
+          onerror: (err) => { 
+            console.error("Live Error:", err);
+            setErrorMessage('พบข้อผิดพลาดในการเชื่อมต่อกับ AI'); 
+            stopSession(); 
+          },
           onclose: () => stopSession()
         }
       });
       sessionRef.current = await sessionPromise;
     } catch (err: any) {
+      console.error("Initialization error:", err);
       setErrorMessage(`เกิดข้อผิดพลาด: ${err.message || 'Unknown'}`);
       setStatus('error');
     }
   };
 
-  // Add missing copyToClipboard function
   const copyToClipboard = useCallback((text: string, id: string) => {
+    if (!navigator.clipboard) {
+      setErrorMessage('เบราว์เซอร์ไม่รองรับการคัดลอก');
+      return;
+    }
     navigator.clipboard.writeText(text).then(() => {
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
@@ -273,6 +286,25 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Desktop Role Switcher */}
+            <div className="hidden md:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl border border-slate-200 dark:border-slate-700 mr-2">
+              {(['Professor', 'Student'] as UserRole[]).map((role) => (
+                <button
+                  key={role}
+                  disabled={isRecording}
+                  onClick={() => setActiveRole(role)}
+                  className={`px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${
+                    activeRole === role 
+                      ? `${activeAccent.bg} text-white shadow-sm` 
+                      : 'text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'
+                  } disabled:opacity-50`}
+                >
+                  <i className={`fas ${role === 'Professor' ? 'fa-user-tie' : 'fa-user-graduate'}`}></i>
+                  {role === 'Professor' ? 'Teacher Mode' : 'Student Mode'}
+                </button>
+              ))}
+            </div>
+
             <div className="hidden sm:flex items-center bg-slate-100 dark:bg-slate-800 p-1 rounded-xl border border-slate-200 dark:border-slate-700">
               {(['Female', 'Male'] as VoiceGender[]).map((gender) => (
                 <button
@@ -318,7 +350,7 @@ const App: React.FC = () => {
               } disabled:opacity-50`}
             >
               <i className={`fas ${role === 'Professor' ? 'fa-user-tie' : 'fa-user-graduate'}`}></i>
-              {role === 'Professor' ? 'อาจารย์' : 'นักศึกษา'}
+              {role === 'Professor' ? 'Teacher Mode' : 'Student Mode'}
             </button>
           ))}
         </div>
@@ -332,7 +364,7 @@ const App: React.FC = () => {
               <div className="flex items-center gap-3">
                 <h2 className="text-sm font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest">Active Processing</h2>
                 <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${activeRole === 'Professor' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>
-                  {activeRole === 'Professor' ? 'อาจารย์ MODE' : 'นักศึกษา MODE'}
+                  {activeRole === 'Professor' ? 'TEACHER MODE' : 'STUDENT MODE'}
                 </span>
               </div>
               {status === 'listening' && <div className="flex items-center gap-2 text-[10px] font-bold text-green-500 bg-green-500/10 px-3 py-1 rounded-full"><span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-ping"></span> Live</div>}
@@ -374,10 +406,10 @@ const App: React.FC = () => {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button onClick={exportTranscript} className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:shadow-md transition-all active:scale-95">
+              <button onClick={exportTranscript} className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:shadow-md transition-all active:scale-95" title="Export as Text">
                 <i className="fas fa-file-export"></i>
               </button>
-              <button onClick={clearHistory} className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all active:scale-95">
+              <button onClick={clearHistory} className="p-2.5 rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all active:scale-95" title="Clear All">
                 <i className="fas fa-trash-alt"></i>
               </button>
             </div>
@@ -398,10 +430,10 @@ const App: React.FC = () => {
                   {idx > 0 && <div className="absolute -top-8 left-12 w-px h-8 bg-slate-100 dark:bg-slate-800"></div>}
                   <div className="flex items-start gap-6">
                     <div className="flex flex-col items-center gap-2 pt-1">
-                      <button onClick={() => toggleRole(entry.id)} className={`w-12 h-12 rounded-2xl flex items-center justify-center text-xl shadow-lg transition-all active:scale-90 ${entry.role === 'Professor' ? `${activeAccent.bg} text-white shadow-blue-500/20` : 'bg-slate-800 text-white shadow-slate-900/20'}`}>
+                      <button onClick={() => toggleRole(entry.id)} className={`w-12 h-12 rounded-2xl flex items-center justify-center text-xl shadow-lg transition-all active:scale-90 ${entry.role === 'Professor' ? `${activeAccent.bg} text-white shadow-blue-500/20` : 'bg-slate-800 text-white shadow-slate-900/20'}`} title="Switch Role Label">
                         <i className={`fas ${entry.role === 'Professor' ? 'fa-user-tie' : 'fa-user-graduate'}`}></i>
                       </button>
-                      <span className="text-[9px] font-black uppercase text-slate-400 dark:text-slate-600 tracking-tighter">{entry.role === 'Professor' ? 'อาจารย์' : 'นักศึกษา'}</span>
+                      <span className="text-[9px] font-black uppercase text-slate-400 dark:text-slate-600 tracking-tighter">{entry.role === 'Professor' ? 'Teacher' : 'Student'}</span>
                     </div>
                     <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div className="bg-white dark:bg-slate-800/50 p-6 rounded-[1.5rem] border border-slate-100 dark:border-slate-800 shadow-sm relative group/bubble">
@@ -419,6 +451,7 @@ const App: React.FC = () => {
                           </button>
                         </div>
                         <p className="text-slate-900 dark:text-blue-50 font-bold leading-relaxed">{entry.translation}</p>
+                        {copiedId === entry.id && <span className="absolute top-0 right-12 mt-1.5 bg-slate-900 text-white text-[8px] px-2 py-1 rounded-lg animate-fadeIn z-20">Copied</span>}
                       </div>
                     </div>
                   </div>
@@ -435,7 +468,7 @@ const App: React.FC = () => {
             <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
             <span>System Active</span>
           </div>
-          <span>Mode: {activeRole}</span>
+          <span>Role: {activeRole === 'Professor' ? 'Teacher Mode' : 'Student Mode'}</span>
           <span className="hidden sm:inline">| Voice: {voiceGender}</span>
         </div>
         <div className="text-[9px] md:text-[10px] font-black tracking-[0.1em] md:tracking-[0.2em] uppercase text-center md:text-right">
