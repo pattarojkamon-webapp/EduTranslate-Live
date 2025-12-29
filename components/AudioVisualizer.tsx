@@ -2,21 +2,15 @@
 import React, { useEffect, useRef } from 'react';
 
 interface AudioVisualizerProps {
-  stream: MediaStream | null;
+  analyser: AnalyserNode | null;
   isActive: boolean;
 }
 
-const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ stream, isActive }) => {
+const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ analyser, isActive }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    if (!isActive || !stream || !canvasRef.current) return;
-
-    const audioContext = new AudioContext();
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
+    if (!isActive || !analyser || !canvasRef.current) return;
 
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
@@ -48,9 +42,8 @@ const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ stream, isActive }) =
 
     return () => {
       cancelAnimationFrame(animationFrameId);
-      audioContext.close();
     };
-  }, [stream, isActive]);
+  }, [analyser, isActive]);
 
   return (
     <canvas 
